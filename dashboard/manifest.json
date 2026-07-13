@@ -1,0 +1,10 @@
+{
+  "name": "hermes-engram",
+  "label": "Engram",
+  "description": "Mobile companion API — threads, routines, profiles, models",
+  "icon": "Smartphone",
+  "version": "0.1.0",
+  "tab": { "hidden": true },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

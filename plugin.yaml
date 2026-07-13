@@ -1,0 +1,5 @@
+name: hermes-engram
+version: 0.1.0
+description: Engram mobile companion API — threads, routines, profiles, models over HTTP/WS
+author: jesse
+kind: standalone
