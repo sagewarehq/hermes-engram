@@ -648,6 +648,11 @@ def health():
     except Exception as exc:
         log.warning("engram health: profiles failed: %s", exc)
 
+    scopes = ["chat", "threads", "routines", "profiles", "models", "feedback"]
+    if _kanban() is not None:
+        # Feature-detected by the app: older hermes installs have no kanban.
+        scopes.append("tasks")
+
     return {
         "ok": True,
         "service": "hermes-engram",
@@ -658,7 +663,7 @@ def health():
         "threads": {"total": threads_total},
         "routines": {"total": routines_total, "enabled": routines_enabled},
         "gateway": {"chat_rpc": _chat_rpc_available()},
-        "scopes": ["chat", "threads", "routines", "profiles", "models", "feedback"],
+        "scopes": scopes,
     }
 
 
@@ -1846,6 +1851,358 @@ def post_feedback(payload: FeedbackBody):
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"failed to store feedback: {exc}")
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Tasks — the app's "Needs you" surface over the kanban board.
+#
+# A task is a kanban board row (hermes_cli.kanban_db, its own per-board
+# SQLite store), not a session; every dispatch attempt runs as an ordinary
+# hermes session, recorded in task_runs with the worker's session id in the
+# run metadata. This surface is deliberately narrow: list + detail + the two
+# human verbs (comment, reply-and-resume). Board management, drag-drop and
+# free status editing stay in the kanban dashboard.
+#
+# Statuses collapse into four app-facing groups; the dispatcher's state
+# machine is otherwise opaque to the app:
+#   needs_you : blocked, review, and triage with block_recurrences > 0
+#               (a task the block-loop guard routed to triage — without this
+#               clause it would silently vanish from the app's blocked view)
+#   running   : running
+#   queued    : triage, todo, scheduled, ready
+#   done      : done
+# ---------------------------------------------------------------------------
+
+_TASK_GROUPS = ("needs_you", "running", "queued", "done", "all")
+
+# Comment authors that render as the human side of the conversation. Worker
+# comments carry the assignee profile name; `hermes kanban comment` uses the
+# active profile or "user".
+_TASK_HUMAN_AUTHORS = frozenset({"engram", "dashboard", "user", "human"})
+
+# Event kinds whose payload["reason"] is the worker's question to the human.
+_TASK_QUESTION_KINDS = ("blocked", "block_loop_detected", "spawn_auto_blocked")
+
+
+def _kanban():
+    """kanban_db module, or None on hermes builds that predate kanban."""
+    try:
+        from hermes_cli import kanban_db
+        return kanban_db
+    except Exception:
+        return None
+
+
+def _kanban_or_503():
+    kb = _kanban()
+    if kb is None:
+        raise HTTPException(
+            status_code=503,
+            detail="kanban is not available on this hermes install",
+        )
+    return kb
+
+
+def _task_board(kb, board: Optional[str]) -> Optional[str]:
+    """Validate a ?board= slug (mirrors the kanban plugin's _resolve_board)."""
+    if not board:
+        return None
+    try:
+        normed = kb._normalize_board_slug(board)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if normed and normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
+        raise HTTPException(status_code=404, detail=f"board {normed!r} does not exist")
+    return normed
+
+
+def _task_conn(kb, board: Optional[str] = None):
+    try:
+        kb.init_db(board=board)
+    except Exception as exc:
+        log.warning("engram: kanban init_db failed: %s", exc)
+    return kb.connect(board=board)
+
+
+def _task_group(task: Any) -> str:
+    s = task.status
+    if s in ("blocked", "review"):
+        return "needs_you"
+    if s == "triage" and (task.block_recurrences or 0) > 0:
+        return "needs_you"
+    if s == "running":
+        return "running"
+    if s == "done":
+        return "done"
+    return "queued"
+
+
+def _task_maps(conn, task_ids: list) -> tuple[dict, dict, dict]:
+    """(question, comment_count, last_activity) per task id, in three queries."""
+    if not task_ids:
+        return {}, {}, {}
+    marks = ",".join("?" * len(task_ids))
+    questions: dict = {}
+    rows = conn.execute(
+        f"SELECT task_id, payload FROM task_events "
+        f"WHERE task_id IN ({marks}) AND kind IN "
+        f"({','.join('?' * len(_TASK_QUESTION_KINDS))}) "
+        f"ORDER BY created_at ASC, id ASC",
+        [*task_ids, *_TASK_QUESTION_KINDS],
+    ).fetchall()
+    for r in rows:  # ascending — the newest reason wins
+        try:
+            payload = json.loads(r["payload"]) if r["payload"] else {}
+        except Exception:
+            payload = {}
+        if payload.get("reason"):
+            questions[r["task_id"]] = payload["reason"]
+    counts = {
+        r["task_id"]: r["n"]
+        for r in conn.execute(
+            f"SELECT task_id, COUNT(*) AS n FROM task_comments "
+            f"WHERE task_id IN ({marks}) GROUP BY task_id",
+            task_ids,
+        ).fetchall()
+    }
+    activity = {
+        r["task_id"]: r["ts"]
+        for r in conn.execute(
+            f"SELECT task_id, MAX(created_at) AS ts FROM task_events "
+            f"WHERE task_id IN ({marks}) GROUP BY task_id",
+            task_ids,
+        ).fetchall()
+    }
+    return questions, counts, activity
+
+
+def _task_card(task: Any, question: Optional[str], comment_count: int,
+               last_activity: Optional[int]) -> dict:
+    return {
+        "id": task.id,
+        "title": task.title,
+        "group": _task_group(task),
+        "status": task.status,
+        "block_kind": task.block_kind,
+        "block_recurrences": task.block_recurrences,
+        "assignee": task.assignee,
+        "priority": task.priority,
+        "created_by": task.created_by,
+        "question": question,
+        "origin_session_id": task.session_id,
+        "comment_count": comment_count,
+        "created_at": task.created_at,
+        "started_at": task.started_at,
+        "completed_at": task.completed_at,
+        "last_activity": last_activity or task.completed_at
+                         or task.started_at or task.created_at,
+    }
+
+
+def _task_messages(comments: list, events: list) -> list:
+    """Merge the comment thread and event log into me/agent/event messages.
+
+    Worker questions (the reason on blocked-style events) render as agent
+    bubbles — they are the worker speaking, not board bookkeeping.
+    `commented` events are skipped (the comment rows carry the content).
+    """
+    out: list = []
+    comment_bodies = []
+    for c in comments:
+        side = "me" if (c.author or "").lower() in _TASK_HUMAN_AUTHORS else "agent"
+        comment_bodies.append(c.body or "")
+        out.append({
+            "id": f"c{c.id}", "kind": side, "text": c.body,
+            "author": c.author, "ts": c.created_at,
+        })
+    for e in events:
+        payload = e.payload or {}
+        if e.kind == "commented":
+            continue
+        if e.kind in _TASK_QUESTION_KINDS and payload.get("reason"):
+            # `hermes kanban block` (CLI and worker tool) also appends the
+            # reason as a comment — don't show the question twice.
+            if any(payload["reason"] in body for body in comment_bodies):
+                continue
+            out.append({
+                "id": f"e{e.id}", "kind": "agent",
+                "text": payload["reason"], "author": "worker",
+                "ts": e.created_at, "event_kind": e.kind,
+            })
+            continue
+        text = e.kind.replace("_", " ")
+        detail = payload.get("reason") or payload.get("summary") \
+            or payload.get("status") or payload.get("error")
+        if detail:
+            text = f"{text}: {detail}"
+        out.append({
+            "id": f"e{e.id}", "kind": "event", "text": text,
+            "ts": e.created_at, "event_kind": e.kind,
+        })
+    out.sort(key=lambda m: (m["ts"] or 0, m["id"]))
+    return out
+
+
+def _task_run_dict(run: Any) -> dict:
+    meta = run.metadata
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    meta = meta or {}
+    return {
+        "id": run.id,
+        "profile": run.profile,
+        "status": run.status,
+        "outcome": run.outcome,
+        "summary": run.summary,
+        "error": run.error,
+        "started_at": run.started_at,
+        "ended_at": run.ended_at,
+        # The attempt's transcript: open with GET /runs/{id}?profile={profile}.
+        "worker_session_id": meta.get("worker_session_id"),
+    }
+
+
+@router.get("/tasks")
+def list_tasks_endpoint(
+    group: Optional[str] = Query(None, description="needs_you|running|queued|done|all"),
+    origin_session: Optional[str] = Query(
+        None, description="Only tasks created from this session/thread id"),
+    board: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    if group is not None and group not in _TASK_GROUPS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"group must be one of {', '.join(_TASK_GROUPS)}",
+        )
+    kb = _kanban_or_503()
+    conn = _task_conn(kb, board=_task_board(kb, board))
+    try:
+        tasks = kb.list_tasks(conn, session_id=origin_session)
+        if group and group != "all":
+            tasks = [t for t in tasks if _task_group(t) == group]
+        total = len(tasks)
+        _, _, activity = _task_maps(conn, [t.id for t in tasks])
+        tasks.sort(
+            key=lambda t: activity.get(t.id) or t.completed_at
+            or t.started_at or t.created_at or 0,
+            reverse=True,
+        )
+        page = tasks[offset:offset + limit]
+        questions, counts, _ = _task_maps(conn, [t.id for t in page])
+        return {
+            "tasks": [
+                _task_card(t, questions.get(t.id), counts.get(t.id, 0),
+                           activity.get(t.id))
+                for t in page
+            ],
+            "total": total, "limit": limit, "offset": offset,
+            "board": kb.get_current_board() if not board else board,
+        }
+    finally:
+        conn.close()
+
+
+@router.get("/tasks/{task_id}")
+def get_task_endpoint(task_id: str, board: Optional[str] = Query(None)):
+    kb = _kanban_or_503()
+    conn = _task_conn(kb, board=_task_board(kb, board))
+    try:
+        task = kb.get_task(conn, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        comments = kb.list_comments(conn, task_id)
+        events = kb.list_events(conn, task_id)
+        questions, counts, activity = _task_maps(conn, [task_id])
+        card = _task_card(task, questions.get(task_id), counts.get(task_id, 0),
+                          activity.get(task_id))
+        card["body"] = task.body
+        card["result"] = task.result
+        links = {
+            "parents": [r["parent_id"] for r in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?",
+                (task_id,)).fetchall()],
+            "children": [r["child_id"] for r in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ?",
+                (task_id,)).fetchall()],
+        }
+        return {
+            "task": card,
+            "messages": _task_messages(comments, events),
+            "runs": [_task_run_dict(r) for r in kb.list_runs(conn, task_id)],
+            "links": links,
+        }
+    finally:
+        conn.close()
+
+
+class TaskReplyBody(BaseModel):
+    text: str
+    resume: bool = True
+    author: Optional[str] = "engram"
+
+
+@router.post("/tasks/{task_id}/reply")
+def reply_task(task_id: str, payload: TaskReplyBody,
+               board: Optional[str] = Query(None)):
+    """Comment on a task and (by default) send it back to the dispatcher.
+
+    The two human verbs in one call: the answer lands in the comment thread
+    (the next worker spawn reads it via build_worker_context) and the task
+    flips blocked/scheduled -> ready. `resume` on a task that isn't blocked
+    just queues the comment for the next attempt — not an error.
+    """
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    kb = _kanban_or_503()
+    conn = _task_conn(kb, board=_task_board(kb, board))
+    try:
+        task = kb.get_task(conn, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        kb.add_comment(conn, task_id, author=payload.author or "engram", body=text)
+        resumed = False
+        if payload.resume:
+            if task.status in ("blocked", "scheduled"):
+                resumed = kb.unblock_task(conn, task_id)
+            elif task.status == "triage" and (task.block_recurrences or 0) > 0:
+                # Loop-guard-routed task: a human answer is the triage
+                # decision, so send it back to the pool — parent-gated the
+                # same way unblock_task gates ready vs todo.
+                with kb.write_txn(conn):
+                    undone = conn.execute(
+                        "SELECT 1 FROM task_links l "
+                        "JOIN tasks p ON p.id = l.parent_id "
+                        "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+                        (task_id,),
+                    ).fetchone()
+                    new_status = "todo" if undone else "ready"
+                    cur = conn.execute(
+                        "UPDATE tasks SET status = ?, consecutive_failures = 0, "
+                        "last_failure_error = NULL "
+                        "WHERE id = ? AND status = 'triage'",
+                        (new_status, task_id),
+                    )
+                    if cur.rowcount == 1:
+                        kb._append_event(conn, task_id, "unblocked",
+                                         {"status": new_status, "from": "triage"})
+                        resumed = True
+        updated = kb.get_task(conn, task_id)
+        questions, counts, activity = _task_maps(conn, [task_id])
+        return {
+            "ok": True,
+            "resumed": resumed,
+            "task": _task_card(updated, questions.get(task_id),
+                               counts.get(task_id, 0), activity.get(task_id))
+            if updated else None,
+        }
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

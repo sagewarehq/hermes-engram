@@ -134,9 +134,10 @@ Connection-screen health check.
   "threads": {"total": 128},
   "routines": {"total": 5, "enabled": 4},
   "gateway": {"chat_rpc": true},
-  "scopes": ["chat", "threads", "routines", "profiles", "models", "feedback"]
+  "scopes": ["chat", "threads", "routines", "profiles", "models", "feedback", "tasks"]
 }
 ```
+`tasks` appears only when the hermes install has kanban (feature-detect).
 `server_time` lets the client compute clock skew. `gateway.chat_rpc=false` means reads
 work but message sending is unavailable (tui_gateway not importable).
 
@@ -395,6 +396,89 @@ Body `{"read": true|false}`. Item id is the `{profile}:{run_session_id}` composi
 
 #### `POST /inbox/read-all`
 Marks everything read (optionally scoped with `?profile=`). Returns `{ok, marked}`.
+
+### Tasks
+
+Kanban board tasks — the app's "Needs you" surface over `hermes_cli.kanban_db`.
+A task is a durable work item with its own state machine, **not** a session;
+every dispatch attempt runs as an ordinary hermes session (`worker_session_id`
+on runs — open the transcript via `GET /runs/{id}?profile={run.profile}`). This
+surface is deliberately narrow: list + detail + the two human verbs (comment,
+reply-and-resume). Board management, drag-drop and free status editing stay in
+the kanban dashboard.
+
+Board statuses collapse into four app-facing `group`s:
+
+| group | statuses |
+|---|---|
+| `needs_you` | `blocked`, `review`, and `triage` with `block_recurrences > 0` (loop-guard-routed — "stuck") |
+| `running` | `running` |
+| `queued` | `triage`, `todo`, `scheduled`, `ready` |
+| `done` | `done` |
+
+All endpoints take `?board=` (default: the active board) and 503 on hermes
+installs that predate kanban; `/health` advertises the `tasks` scope when
+available (feature-detect against older gateways).
+
+#### `GET /tasks`
+Query params: `group` (one of the four, or `all`), `origin_session` (only tasks
+created from that session/thread id — agent-created tasks are stamped with
+their originating session), `board`, `limit`, `offset`. Sorted by last activity
+(latest task event), newest first.
+
+```json
+{
+  "tasks": [
+    {
+      "id": "t_4bb85f75", "title": "Ice cream cost analysis",
+      "group": "needs_you", "status": "blocked",
+      "block_kind": "needs_input", "block_recurrences": 1,
+      "assignee": "default", "priority": 0, "created_by": "user",
+      "question": "Which ice cream flavor would you like to have right now?",
+      "origin_session_id": null, "comment_count": 1,
+      "created_at": 1784020029, "started_at": null, "completed_at": null,
+      "last_activity": 1784020029
+    }
+  ],
+  "total": 1, "limit": 50, "offset": 0, "board": "default"
+}
+```
+
+`question` is the worker's ask to the human — the latest blocked-style event's
+reason. `block_kind` = `needs_input` | `capability` | `transient` | `dependency`.
+
+#### `GET /tasks/{id}`
+Card fields plus `body` (the brief) and `result`, with the comment thread and
+event log merged into the app's message vocabulary: comments from human authors
+(`engram`, `dashboard`, `user`, `human`) → `me`, worker comments and
+blocked-event questions → `agent`, board bookkeeping → `event`. Message ids are
+composite strings (`c<id>` comment, `e<id>` event) — unique across the merged
+stream, unlike thread row ids.
+
+```json
+{
+  "task": {"id": "t_4bb85f75", "group": "needs_you", "body": "Research…", "...": "as in list"},
+  "messages": [
+    {"id": "e1", "kind": "event", "text": "created: ready", "ts": 1784020029, "event_kind": "created"},
+    {"id": "c1", "kind": "agent", "text": "BLOCKED: Which ice cream flavor…", "author": "default", "ts": 1784020071}
+  ],
+  "runs": [
+    {"id": 1, "profile": "default", "status": "blocked", "outcome": "blocked",
+     "summary": "Which ice cream flavor…", "error": null,
+     "started_at": 1784020071, "ended_at": 1784020071, "worker_session_id": null}
+  ],
+  "links": {"parents": [], "children": []}
+}
+```
+
+#### `POST /tasks/{id}/reply`
+The two human verbs in one call. Body: `{"text": "…", "resume": true}`
+(`author` optional, default `engram`). Appends the comment (the next worker
+spawn reads the full thread via the kanban worker context) and, when `resume`
+is true, hands the task back to the dispatcher: `blocked`/`scheduled` →
+unblock; loop-guard-routed `triage` → parent-gated `ready`/`todo`. `resume` on
+a task that isn't waiting just queues the comment for the next attempt — not an
+error. Returns `{ok, resumed, task}`.
 
 ### Feedback
 
