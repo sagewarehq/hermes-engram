@@ -170,7 +170,15 @@ later iteration; the feed's "Needs you" filter degrades gracefully without it.
 #### `GET /threads`
 Query params: `limit` (default 30), `offset`, `status` = `open|resolved|all` (default `open`),
 `profile` = a profile name or `all` (default `all` — aggregates every profile's store,
-merged by `last_active`), `q` (title/content search — reserved).
+merged by `last_active`), `source` (filter by origin surface, see below),
+`q` (title/content search — reserved).
+
+Every thread carries a `source` label — the surface it was created from:
+`engram` (threads started through this API), `tui` / `desktop` / `cli`
+(hermes-native sessions), `cron` (routine runs). The `source` param filters server-side with
+correct pagination: `?source=engram` for only Engram-spawned threads, or
+`?source=!engram` (a `!`-prefixed, comma-separable list) to exclude them — so a
+client can show its own threads first and tuck the rest into a collapsed group.
 
 ```json
 {
@@ -405,7 +413,8 @@ Server → client frames:
 {"type": "pulse", "running": false, "count": 0, "ts": 1783971000.1}
 {"type": "messages", "cursor": {"default": 1809, "erudifi": 177},
  "items": [{"id": 1809, "profile": "default", "session_id": "20260714_…",
-             "kind": "agent", "text": "…", "tool_name": null, "ts": 1752448100.0}]}
+             "source": "engram", "kind": "agent", "text": "…",
+             "tool_name": null, "ts": 1752448100.0}]}
 {"type": "pulse", "running": true, "count": 1, "ts": 1783971004.2}
 ```
 
@@ -420,7 +429,9 @@ regardless. Two client behaviors bind to it:
    interval), consider the connection dead and reconnect with the last `cursor`.
 
 Every persisted message (from any surface: this API, the TUI, the desktop app, cron runs)
-appears here — the feed screen updates no matter where a turn ran. Token-level streaming
+appears here — the feed screen updates no matter where a turn ran. Each item carries its
+session's `source` label (same vocabulary as `GET /threads`), so a client filtering
+client-side can classify live frames without refetching the thread list. Token-level streaming
 deltas are *not* on this socket; for live typing indicators the app can additionally speak
 the dashboard's `/api/ws` JSON-RPC protocol (same server, same token), which this plugin
 deliberately does not duplicate.

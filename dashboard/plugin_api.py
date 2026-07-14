@@ -713,8 +713,27 @@ def models():
 # Threads
 # ---------------------------------------------------------------------------
 
+def _parse_source_filter(source: Optional[str]) -> tuple:
+    """``"engram"`` → include set; ``"!engram"`` → exclude set; None → no filter.
+
+    Comma-separated; a leading ``!`` flips the whole list to an exclusion
+    (mixing include and exclude labels makes no sense, so the first label
+    decides the mode).
+    """
+    if not source:
+        return None, None
+    labels = [s.strip().lower() for s in source.split(",") if s.strip()]
+    if not labels:
+        return None, None
+    if labels[0].startswith("!"):
+        return None, frozenset(l.lstrip("!") for l in labels if l.lstrip("!"))
+    return frozenset(labels), None
+
+
 def _list_threads_for(profile: str, fetch: int, include_archived: bool,
-                      status: str, running_map: dict) -> list:
+                      status: str, running_map: dict,
+                      include_sources: Optional[frozenset] = None,
+                      exclude_sources: Optional[frozenset] = None) -> list:
     try:
         db = _db(profile)
     except HTTPException:
@@ -722,14 +741,34 @@ def _list_threads_for(profile: str, fetch: int, include_archived: bool,
     except Exception as exc:
         log.warning("engram: opening %s state.db failed: %s", profile, exc)
         return []
+    # Push the source filter into SQL where the installed SessionDB supports
+    # it (correct LIMIT); the Python filter below stays as the portable path.
+    kwargs: dict = dict(
+        limit=fetch,
+        order_by_last_active=True,
+        include_archived=include_archived,
+    )
+    if include_sources and len(include_sources) == 1:
+        kwargs["source"] = next(iter(include_sources))
+    elif exclude_sources:
+        kwargs["exclude_sources"] = sorted(exclude_sources)
     try:
-        rows = db.list_sessions_rich(
-            limit=fetch,
-            order_by_last_active=True,
-            include_archived=include_archived,
-        )
+        rows = db.list_sessions_rich(**kwargs)
     except TypeError:
-        rows = db.list_sessions_rich(limit=fetch)
+        try:
+            rows = db.list_sessions_rich(
+                limit=fetch,
+                order_by_last_active=True,
+                include_archived=include_archived,
+            )
+        except TypeError:
+            rows = db.list_sessions_rich(limit=fetch)
+    if include_sources:
+        rows = [r for r in rows
+                if (r.get("source") or "").strip().lower() in include_sources]
+    elif exclude_sources:
+        rows = [r for r in rows
+                if (r.get("source") or "").strip().lower() not in exclude_sources]
     if status == "resolved":
         rows = [r for r in rows if r.get("archived")]
     return [_thread_dict(r, running_map, profile) for r in rows]
@@ -741,10 +780,22 @@ def list_threads(
     offset: int = Query(0, ge=0),
     status: str = Query("open", pattern="^(open|resolved|all)$"),
     profile: str = Query("all", description='Profile name, or "all" to aggregate'),
+    source: Optional[str] = Query(
+        None,
+        description='Comma-separated source labels to include (e.g. "engram"), '
+                    'or "!"-prefixed to exclude (e.g. "!engram"). Every thread '
+                    'carries the surface it was created from: "engram" (this '
+                    'API), "tui"/"desktop" (hermes), "cron" (routine runs).',
+    ),
 ):
     include_archived = status in ("resolved", "all")
+    include_sources, exclude_sources = _parse_source_filter(source)
     running_map = _running_map()
     fetch = limit + offset
+    if include_sources or exclude_sources:
+        # Over-fetch: on older installs the SQL pushdown falls back and the
+        # filter runs in Python over a LIMIT'd page (multi-source always does).
+        fetch = max(fetch * 2, 200)
     profiles = _profile_names() if profile == "all" else [profile]
     if profile != "all":
         _profile_home_or_404(profile)  # 404 early on unknown profile
@@ -753,9 +804,19 @@ def list_threads(
     total = 0
     total_known = True
     for name in profiles:
-        threads.extend(_list_threads_for(name, fetch, include_archived, status, running_map))
+        threads.extend(_list_threads_for(name, fetch, include_archived, status,
+                                         running_map, include_sources, exclude_sources))
         try:
-            total += _db(name).session_count(include_archived=include_archived)
+            db = _db(name)
+            if include_sources:
+                # sources are disjoint, so per-source counts sum cleanly
+                total += sum(db.session_count(include_archived=include_archived, source=s)
+                             for s in include_sources)
+            elif exclude_sources:
+                total += db.session_count(include_archived=include_archived,
+                                          exclude_sources=sorted(exclude_sources))
+            else:
+                total += db.session_count(include_archived=include_archived)
         except Exception:
             total_known = False
     threads.sort(key=lambda t: t.get("last_active") or t.get("started_at") or 0, reverse=True)
@@ -766,6 +827,7 @@ def list_threads(
         "limit": limit,
         "offset": offset,
         "profile": profile,
+        "source": source,
     }
 
 
@@ -1537,8 +1599,10 @@ def _events_fetch_one(profile: str, cursor: int) -> tuple[int, list]:
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
-            "SELECT id, session_id, role, content, tool_name, timestamp "
-            "FROM messages WHERE id > ? AND active = 1 ORDER BY id ASC LIMIT 200",
+            "SELECT m.id, m.session_id, m.role, m.content, m.tool_name, m.timestamp, "
+            "s.source AS source "
+            "FROM messages m LEFT JOIN sessions s ON s.id = m.session_id "
+            "WHERE m.id > ? AND m.active = 1 ORDER BY m.id ASC LIMIT 200",
             (cursor,),
         ).fetchall()
         items = []
@@ -1550,6 +1614,7 @@ def _events_fetch_one(profile: str, cursor: int) -> tuple[int, list]:
                 "id": r["id"],
                 "profile": profile,
                 "session_id": r["session_id"],
+                "source": r["source"] or "",
                 "kind": _KIND_BY_ROLE.get(role, "event"),
                 "text": _content_text(r["content"])[:2000],
                 "tool_name": r["tool_name"],
