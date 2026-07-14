@@ -309,6 +309,13 @@ Run history (newest first, `limit`/`offset`):
             "message_count": 9}]}
 ```
 
+`status` = `running` (unfinished, activity within the last 15 min) | `ok` | `error`
+(finished, from `end_reason`) | `stale` (unfinished but silent >15 min — the scheduler
+was killed mid-run and never finalized the row; the run is dead, treat it as failed).
+A run that is genuinely mid-turn keeps producing message rows, so a live `running`
+never flips to `stale` spuriously; clients should render `stale` as a terminal state,
+not keep polling it.
+
 #### `GET /runs/{session_id}`
 Run transcript — same message normalization as `GET /threads/{id}` (thinking/tool/agent
 cards in the prototype's run detail screen). Works for any session id, but exists so run

@@ -1136,10 +1136,26 @@ def _cron_mutate(profile: str, op: dict) -> Any:
     raise HTTPException(status_code=400, detail=f"unknown op {op['op']!r}")
 
 
+# An unfinished run without a new message for this long is presumed dead.
+# ``ended_at`` stays NULL when the scheduler is killed mid-run (gateway or
+# dashboard restart), which otherwise reads as "running" forever. Every agent
+# turn persists message rows as it goes, so a live run's last_active keeps
+# moving; 15 minutes of silence on an unfinalized cron session means orphaned.
+_RUN_STALE_AFTER = 900.0
+
+
 def _run_dict(row: dict) -> dict:
     ended = row.get("ended_at")
     end_reason = str(row.get("end_reason") or "")
-    status = "running" if not ended else ("error" if "error" in end_reason.lower() else "ok")
+    if ended:
+        status = "error" if "error" in end_reason.lower() else "ok"
+    else:
+        last = row.get("last_active") or row.get("started_at") or 0
+        try:
+            silent = time.time() - float(last)
+        except (TypeError, ValueError):
+            silent = _RUN_STALE_AFTER
+        status = "running" if silent < _RUN_STALE_AFTER else "stale"
     return {
         "session_id": row.get("id"),
         "started_at": row.get("started_at"),
