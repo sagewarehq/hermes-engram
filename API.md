@@ -401,11 +401,19 @@ loopback token) / `?ticket=`. The cursor is an **opaque JSON object** (`{profile
 Server → client frames:
 
 ```json
-{"type": "hello", "cursor": {"default": 1807, "erudifi": 177}}
+{"type": "hello", "cursor": {"default": 1807, "erudifi": 177}, "typing": []}
 {"type": "messages", "cursor": {"default": 1809, "erudifi": 177},
  "items": [{"id": 1809, "profile": "default", "session_id": "20260714_…",
              "kind": "agent", "text": "…", "tool_name": null, "ts": 1752448100.0}]}
+{"type": "typing", "threads": ["20260714_090412_ab12cd34"]}
 ```
+
+**Typing indicator:** a `typing` frame fires whenever the set of mid-turn threads changes
+(and the current set arrives in `hello`). `threads` holds the persistent session ids whose
+agent is currently working — thinking, running tools, or generating — i.e. show the
+pulsing "agent is typing" state on those threads and clear it when the id disappears from
+the next `typing` frame. Granularity is the poll interval (~1.5s). Turn-level, not
+token-level: for token deltas, speak the dashboard's `/api/ws` JSON-RPC protocol instead.
 
 Every persisted message (from any surface: this API, the TUI, the desktop app, cron runs)
 appears here — the feed screen updates no matter where a turn ran. Token-level streaming

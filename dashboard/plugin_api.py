@@ -342,8 +342,19 @@ def _rpc(method: str, params: dict, timeout: float = _RPC_TIMEOUT_SECONDS) -> di
     return result if isinstance(result, dict) else {}
 
 
+_running_cache: dict = {"ts": 0.0, "map": {}}
+_running_cache_lock = threading.Lock()
+
+
 def _running_map() -> dict:
-    """{persistent_session_id: live_status} for sessions live in the gateway."""
+    """{persistent_session_id: live_status} for sessions live in the gateway.
+
+    Cached for ~1s: the /events typing loop polls this per connected client
+    every 1.5s, and one RPC per second total is plenty for an indicator.
+    """
+    with _running_cache_lock:
+        if time.time() - _running_cache["ts"] < 1.0:
+            return _running_cache["map"]
     if not _chat_rpc_available():
         return {}
     try:
@@ -355,7 +366,22 @@ def _running_map() -> dict:
         key = row.get("session_key")
         if key:
             out[str(key)] = str(row.get("status") or "")
+    with _running_cache_lock:
+        _running_cache.update(ts=time.time(), map=out)
     return out
+
+
+# tui_gateway._session_live_status vocabulary: "working" (mid-turn),
+# "starting" (agent building), "waiting" (blocked on an interactive
+# question/approval), "idle".
+_BUSY_STATUSES = frozenset({"working", "starting"})
+
+
+def _typing_set() -> frozenset:
+    """Persistent session ids whose live gateway session is mid-turn."""
+    return frozenset(
+        sid for sid, status in _running_map().items() if status in _BUSY_STATUSES
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -367,13 +393,23 @@ def _thread_dict(row: dict, running_map: Optional[dict] = None,
     sid = str(row.get("id") or "")
     archived = bool(row.get("archived") or 0)
     live_status = (running_map or {}).get(sid, "")
-    running = "run" in live_status  # "running" / variants; absent -> idle
+    running = live_status in _BUSY_STATUSES
+    if archived:
+        status = "resolved"
+    elif live_status == "waiting":
+        # A live session parked on an interactive question/approval — the
+        # prototype's "blocked / needs you" state.
+        status = "blocked"
+    elif running:
+        status = "running"
+    else:
+        status = "open"
     return {
         "id": sid,
         "profile": profile,
+        "status": status,
         "topic": row.get("title") or None,
         "preview": row.get("preview") or None,
-        "status": "resolved" if archived else ("running" if running else "open"),
         "running": running,
         "source": row.get("source") or "",
         "message_count": row.get("message_count") or 0,
@@ -1586,11 +1622,20 @@ async def events_ws(ws: WebSocket):
         since_raw = ws.query_params.get("since")
         cursors = await asyncio.to_thread(_initial_cursors, profiles, since_raw)
 
-        await ws.send_json({"type": "hello", "cursor": cursors})
+        typing: frozenset = await asyncio.to_thread(_typing_set)
+        await ws.send_json({"type": "hello", "cursor": cursors, "typing": sorted(typing)})
         while True:
             cursors, items = await asyncio.to_thread(_events_fetch, cursors)
             if items:
                 await ws.send_json({"type": "messages", "cursor": cursors, "items": items})
+            # Typing indicator: diff the gateway's mid-turn session set and
+            # push only on change. "typing" here means the whole turn —
+            # thinking, tool calls, generation — matching the prototype's
+            # per-thread pulsing dots rather than token-level deltas.
+            now_typing = await asyncio.to_thread(_typing_set)
+            if now_typing != typing:
+                typing = now_typing
+                await ws.send_json({"type": "typing", "threads": sorted(typing)})
             await asyncio.sleep(_EVENT_POLL_SECONDS)
     except WebSocketDisconnect:
         return
