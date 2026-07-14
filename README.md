@@ -17,12 +17,11 @@ message stream over HTTP + WebSocket, mounted by the hermes dashboard at:
 
 ## Install on another instance (from git)
 
-hermes has a built-in git plugin installer; this repo is the package. Push it to a git
-host as `hermes-engram` (the install dir is derived from the repo name and must match the
-plugin name), then on the target instance:
+hermes has a built-in git plugin installer; this repo is the package
+(https://github.com/sagewarehq/hermes-engram). On the target instance:
 
 ```sh
-hermes plugins install <owner>/hermes-engram --enable   # or a full git/ssh URL
+hermes plugins install sagewarehq/hermes-engram --enable   # or the full git/ssh URL
 hermes dashboard   # (re)start — the API mounts at /api/plugins/hermes-engram
 ```
 
