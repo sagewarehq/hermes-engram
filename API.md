@@ -274,6 +274,16 @@ its store at import time), so they carry ~150ms extra latency.
 
 Routine objects carry `"profile"`, mirroring threads.
 
+Finished one-shot jobs self-delete from the cron store, so `GET /routines` also
+synthesizes **completed** entries from the run sessions they left behind in state.db
+(`?completed_days=`, default 7, `0` disables, max 90). Synthetic entries have
+`state: "completed"`, `enabled: false`, `schedule: {"kind": "once", "human": "one-time"}`,
+`next_run_at: null`, and `last_run_at`/`last_status` from the newest run; name and
+instructions are recovered from the run session (title / first prompt). They are
+appended after live routines, newest-finished first. `GET /routines/{id}` and
+`GET /routines/{id}/runs` resolve these ids too, but mutations (`PATCH`, `run`,
+`pause`, `resume`, `DELETE`) 404 — the underlying job no longer exists.
+
 #### `GET /routines`
 ```json
 {
@@ -423,7 +433,20 @@ Server → client frames:
              "source": "engram", "kind": "agent", "text": "…",
              "tool_name": null, "ts": 1752448100.0}]}
 {"type": "pulse", "running": true, "count": 1, "ts": 1783971004.2}
+{"type": "session", "ts": 1783971010.3,
+ "sessions": [{"profile": "default", "session_id": "cron_ab12_…", "source": "cron",
+                "status": "ok", "ended_at": 1783971009.8, "end_reason": "cron_complete",
+                "ts": 1783971010.3}]}
 ```
+
+**Session — lifecycle transitions the messages cursor can't see.** A session finalizing
+stamps `sessions.ended_at` without inserting a message row, so `messages` frames never
+announce a running → done flip. The socket tracks each profile's unfinished-session set
+per tick and pushes transitions: `status` is `"running"` when a session appears,
+`"ok"`/`"error"` (from `end_reason`, same mapping as run rows) when it finalizes.
+There is no replay: only transitions after the socket connects are sent — refetch
+`GET /threads` / routine detail on (re)connect for anything missed. This replaces
+client-side status polling (run detail, routine detail while a run is active).
 
 **Pulse — activity light + keepalive in one frame.** Sent immediately after `hello`, on
 every busy/idle flip (and concurrent-turn `count` change), and at least every **25s**

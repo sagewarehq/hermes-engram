@@ -405,12 +405,20 @@ def _thread_dict(row: dict, running_map: Optional[dict] = None,
         status = "running"
     else:
         status = "open"
+    # A cron session's stored preview is the scheduler's injected
+    # "[IMPORTANT: You are running as a scheduled cron job...]" preamble —
+    # never what the user should see. _list_threads_for overlays the run's
+    # last assistant message instead; this strip is the fallback for any
+    # path that skips the overlay.
+    preview = row.get("preview") or None
+    if preview and preview.lstrip().startswith("[IMPORTANT:"):
+        preview = None
     return {
         "id": sid,
         "profile": profile,
         "status": status,
         "topic": row.get("title") or None,
-        "preview": row.get("preview") or None,
+        "preview": preview,
         "running": running,
         "source": row.get("source") or "",
         "message_count": row.get("message_count") or 0,
@@ -771,7 +779,46 @@ def _list_threads_for(profile: str, fetch: int, include_archived: bool,
                 if (r.get("source") or "").strip().lower() not in exclude_sources]
     if status == "resolved":
         rows = [r for r in rows if r.get("archived")]
-    return [_thread_dict(r, running_map, profile) for r in rows]
+    threads = [_thread_dict(r, running_map, profile) for r in rows]
+    _overlay_cron_previews(profile, threads)
+    return threads
+
+
+def _overlay_cron_previews(profile: str, threads: list) -> None:
+    """Give cron threads a useful preview: the run's last assistant message.
+
+    The stored preview (first user message) is always the scheduler preamble,
+    which _thread_dict drops — so without this, cron threads render blank.
+    The last assistant message is the run's report, or the agent's question
+    when a routine ends by asking for input (the whole point of surfacing
+    runs as threads).
+    """
+    ids = [t["id"] for t in threads
+           if (t.get("source") or "").lower() == "cron" and not t.get("preview")]
+    if not ids:
+        return
+    try:
+        path = _state_db_path(profile)
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
+    except Exception as exc:
+        log.warning("engram: cron preview overlay skipped for %s: %s", profile, exc)
+        return
+    try:
+        by_id = {t["id"]: t for t in threads}
+        for sid in ids:
+            row = conn.execute(
+                "SELECT content FROM messages WHERE session_id = ? "
+                "AND role = 'assistant' AND active = 1 ORDER BY id DESC LIMIT 1",
+                (sid,),
+            ).fetchone()
+            if row:
+                text = _content_text(row[0]).strip()
+                if text:
+                    by_id[sid]["preview"] = text[:200]
+    except Exception as exc:
+        log.warning("engram: cron preview overlay failed for %s: %s", profile, exc)
+    finally:
+        conn.close()
 
 
 @router.get("/threads")
@@ -992,10 +1039,15 @@ def _schedule_dict(schedule: Any) -> dict:
 
 
 def _routine_dict(job: dict, profile: str = "default") -> dict:
+    # Non-launch profiles' jobs come straight from jobs.json without cron's
+    # read normalization, so name can be null there — the app requires one.
+    name = (job.get("name") or "").strip() \
+        or (job.get("prompt") or "")[:50].strip() \
+        or job.get("id") or "routine"
     return {
         "id": job.get("id"),
         "profile": profile,
-        "name": job.get("name"),
+        "name": name,
         "instructions": job.get("prompt"),
         "schedule": _schedule_dict(job.get("schedule")),
         "enabled": bool(job.get("enabled", True)),
@@ -1039,6 +1091,153 @@ def _find_job(job_id: str, profile_hint: Optional[str] = None) -> tuple:
         for job in _profile_jobs(name):
             if job.get("id") == job_id or job.get("name") == job_id:
                 return name, job
+    raise HTTPException(status_code=404, detail=f"routine {job_id} not found")
+
+
+# Finite one-shot jobs self-destruct when they hit their repeat limit —
+# cron/jobs.py mark_job_run pops them from jobs.json — so a completed task
+# leaves no trace in the live store. Its run sessions in state.db are the
+# durable record (session id ``cron_{job_id}_{ts}``, title "<job-name> · <date>"):
+# synthesize state="completed" routines from recent cron sessions whose job id
+# is gone, so the app keeps showing finished tasks.
+_COMPLETED_SCAN_LIMIT = 300  # newest cron sessions considered per profile
+
+
+def _epoch_iso(epoch: Any) -> Optional[str]:
+    """Session epoch seconds -> tz-aware ISO, matching jobs.json timestamps."""
+    try:
+        return datetime.fromtimestamp(float(epoch)).astimezone().isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _strip_cron_preamble(text: str) -> Optional[str]:
+    """First user message of a cron run -> the job's prompt.
+
+    The scheduler prefixes every run with an "[IMPORTANT: You are running as
+    a scheduled cron job...]" block. It can contain nested brackets
+    ("[SILENT]"), so cut at the closing "]" followed by a blank line rather
+    than the first "]".
+    """
+    text = (text or "").strip()
+    if text.startswith("[IMPORTANT:"):
+        end = text.find("]\n\n")
+        text = text[end + 1:].strip() if end != -1 else ""
+    return text or None
+
+
+def _completed_routine_dict(profile: str, job_id: str, row: Any, conn: Any) -> dict:
+    """Newest run session row -> synthetic completed routine."""
+    title = str(row["title"] or "")
+    # Run titles are "<job-name> · <short date>" (rename tests may lack the tail).
+    name = title.rsplit(" · ", 1)[0].strip() or job_id
+    instructions = None
+    try:
+        first = conn.execute(
+            "SELECT content FROM messages WHERE session_id = ? AND role = 'user' "
+            "AND active = 1 ORDER BY id LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        if first:
+            instructions = _strip_cron_preamble(_content_text(first["content"]))
+    except sqlite3.Error:
+        pass
+    ended = row["ended_at"]
+    end_reason = str(row["end_reason"] or "")
+    if ended:
+        status = "error" if "error" in end_reason.lower() else "ok"
+    else:
+        # The job is gone, so nothing can still be running it — an
+        # unfinalized newest run means the scheduler died mid-run.
+        status = "stale"
+    return {
+        "id": job_id,
+        "profile": profile,
+        "name": name,
+        "instructions": instructions,
+        "schedule": {"kind": "once", "human": "one-time"},
+        "enabled": False,
+        "state": "completed",
+        "next_run_at": None,
+        "last_run_at": _epoch_iso(ended or row["started_at"]),
+        "last_status": status,
+        "model": None,
+        "deliver": None,
+    }
+
+
+def _completed_routines(profile: str, days: int, live_ids: set) -> list:
+    """Completed (self-deleted) jobs for one profile, from recent cron runs."""
+    try:
+        path = _state_db_path(profile)
+    except HTTPException:
+        return []
+    if not path.is_file():
+        return []
+    cutoff = time.time() - days * 86400.0
+    out: list = []
+    seen: set = set()
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
+    except sqlite3.Error as exc:
+        log.warning("engram: opening %s failed: %s", path, exc)
+        return []
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT id, title, started_at, ended_at, end_reason FROM sessions "
+            "WHERE source = 'cron' AND started_at >= ? "
+            "ORDER BY started_at DESC LIMIT ?",
+            (cutoff, _COMPLETED_SCAN_LIMIT),
+        ).fetchall()
+        for r in rows:
+            job_id = _parse_cron_session_id(r["id"])
+            if not job_id or job_id in live_ids or job_id in seen:
+                continue
+            seen.add(job_id)
+            out.append(_completed_routine_dict(profile, job_id, r, conn))
+    except sqlite3.Error as exc:
+        log.warning("engram: scanning completed routines failed: %s", exc)
+    finally:
+        conn.close()
+    return out
+
+
+def _find_completed_routine(job_id: str, profile_hint: Optional[str]) -> tuple:
+    """Locate a finished (self-deleted) job by the run sessions it left behind.
+
+    Bounded ``[prefix, hi)`` id-range scan like SessionDB.list_cron_job_runs —
+    no time window, so old completed routines stay openable from stale clients.
+    Raises 404 if no profile has runs for the id.
+    """
+    profiles = [profile_hint] if profile_hint and profile_hint != "all" else _profile_names()
+    prefix = f"cron_{job_id}_"
+    prefix_hi = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+    for name in profiles:
+        try:
+            path = _state_db_path(name)
+        except HTTPException:
+            continue
+        if not path.is_file():
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
+        except sqlite3.Error:
+            continue
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT id, title, started_at, ended_at, end_reason FROM sessions "
+                "WHERE source = 'cron' AND id >= ? AND id < ? "
+                "ORDER BY started_at DESC LIMIT 1",
+                (prefix, prefix_hi),
+            ).fetchone()
+            if row:
+                return name, _completed_routine_dict(name, job_id, row, conn)
+        except sqlite3.Error:
+            pass
+        finally:
+            conn.close()
     raise HTTPException(status_code=404, detail=f"routine {job_id} not found")
 
 
@@ -1156,25 +1355,45 @@ def _run_dict(row: dict) -> dict:
         except (TypeError, ValueError):
             silent = _RUN_STALE_AFTER
         status = "running" if silent < _RUN_STALE_AFTER else "stale"
+    # A cron session's first user message is the scheduler's injected
+    # "[IMPORTANT: You are running as a scheduled cron job...]" preamble —
+    # useless as a row summary, so drop it and let clients fall back to
+    # status + duration.
+    preview = row.get("preview") or None
+    if preview and preview.lstrip().startswith("[IMPORTANT:"):
+        preview = None
     return {
         "session_id": row.get("id"),
         "started_at": row.get("started_at"),
         "ended_at": ended,
         "status": status,
-        "preview": row.get("preview") or None,
+        "preview": preview,
         "message_count": row.get("message_count") or 0,
     }
 
 
 @router.get("/routines")
-def list_routines(profile: str = Query("all", description='Profile name, or "all"')):
+def list_routines(
+    profile: str = Query("all", description='Profile name, or "all"'),
+    completed_days: int = Query(
+        7, ge=0, le=90,
+        description="Also include one-shot jobs that finished (and self-deleted) "
+                    "within this many days; 0 = live jobs only",
+    ),
+):
     profiles = _profile_names() if profile == "all" else [profile]
     if profile != "all":
         _profile_home_or_404(profile)
     routines: list = []
+    completed: list = []
     for name in profiles:
-        routines.extend(_routine_dict(j, name) for j in _profile_jobs(name))
-    return {"routines": routines, "profile": profile}
+        jobs = _profile_jobs(name)
+        routines.extend(_routine_dict(j, name) for j in jobs)
+        if completed_days > 0:
+            live_ids = {j.get("id") for j in jobs}
+            completed.extend(_completed_routines(name, completed_days, live_ids))
+    completed.sort(key=lambda r: r.get("last_run_at") or "", reverse=True)
+    return {"routines": routines + completed, "profile": profile}
 
 
 class CreateRoutineBody(BaseModel):
@@ -1202,13 +1421,23 @@ def create_routine(payload: CreateRoutineBody):
 
 @router.get("/routines/{job_id}")
 def get_routine(job_id: str, profile: Optional[str] = Query(None)):
-    pname, job = _find_job(job_id, profile)
+    try:
+        pname, job = _find_job(job_id, profile)
+        routine = _routine_dict(job, pname)
+        run_job_id = job["id"]
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        # Finished one-shots self-delete from jobs.json; serve them from
+        # their surviving run sessions so the detail screen still opens.
+        pname, routine = _find_completed_routine(job_id, profile)
+        run_job_id = job_id
     runs: list = []
     try:
-        runs = [_run_dict(r) for r in _db(pname).list_cron_job_runs(job["id"], limit=10)]
+        runs = [_run_dict(r) for r in _db(pname).list_cron_job_runs(run_job_id, limit=10)]
     except Exception as exc:
         log.warning("engram: list_cron_job_runs failed: %s", exc)
-    return {"routine": _routine_dict(job, pname), "runs": runs}
+    return {"routine": routine, "runs": runs}
 
 
 class UpdateRoutineBody(BaseModel):
@@ -1286,8 +1515,15 @@ def routine_runs(
     offset: int = Query(0, ge=0),
     profile: Optional[str] = Query(None),
 ):
-    pname, job = _find_job(job_id, profile)
-    rows = _db(pname).list_cron_job_runs(job["id"], limit=limit, offset=offset)
+    try:
+        pname, job = _find_job(job_id, profile)
+        run_job_id = job["id"]
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        pname, _routine = _find_completed_routine(job_id, profile)
+        run_job_id = job_id
+    rows = _db(pname).list_cron_job_runs(run_job_id, limit=limit, offset=offset)
     return {"runs": [_run_dict(r) for r in rows], "profile": pname}
 
 
@@ -1298,7 +1534,23 @@ def get_run(
     offset: int = Query(0, ge=0),
     profile: str = Query("default"),
 ):
-    return _session_transcript(session_id, limit, offset, None, profile)
+    # The app navigates to runs without knowing their profile. Cron session
+    # ids are globally unique (cron_{job_id}_{ts}), so fall through to the
+    # other profiles' stores before giving up.
+    try:
+        return _session_transcript(session_id, limit, offset, None, profile)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+    for name in _profile_names():
+        if name == profile:
+            continue
+        try:
+            return _session_transcript(session_id, limit, offset, None, name)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+    raise HTTPException(status_code=404, detail=f"session {session_id} not found")
 
 
 # ---------------------------------------------------------------------------
@@ -1656,6 +1908,109 @@ def _events_fetch(cursors: dict) -> tuple[dict, list]:
     return out, items
 
 
+# The messages cursor only surfaces row INSERTs, so a session's
+# running -> ok/error flip (sessions.ended_at being stamped, often with no
+# accompanying message row) never produces a frame on its own. Clients used
+# to paper over this with HTTP polls; instead the events socket tracks each
+# profile's unfinished-session set per tick and announces transitions as
+# "session" frames.
+
+def _session_lifecycle_snapshot(profile: str) -> Optional[dict]:
+    """{session_id: source} of unfinished sessions, or None on read failure.
+
+    None (rather than {}) matters: treating a transient failure as "no
+    unfinished sessions" would fabricate an ended-transition for every live
+    session, then a started-transition when the read recovers.
+    """
+    try:
+        path = _state_db_path(profile)
+    except HTTPException:
+        return {}
+    if not path.is_file():
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
+    except sqlite3.Error:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT id, source FROM sessions WHERE ended_at IS NULL"
+        ).fetchall()
+        return {r[0]: r[1] or "" for r in rows}
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+def _session_ended_rows(profile: str, ids: list) -> list:
+    if not ids:
+        return []
+    try:
+        path = _state_db_path(profile)
+    except HTTPException:
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
+    except sqlite3.Error:
+        return []
+    conn.row_factory = sqlite3.Row
+    try:
+        marks = ",".join("?" * len(ids))
+        return conn.execute(
+            f"SELECT id, source, ended_at, end_reason FROM sessions WHERE id IN ({marks})",
+            ids,
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def _session_transitions(profiles: list, prev: Optional[dict]) -> tuple[dict, list]:
+    """Diff unfinished-session sets against the previous tick.
+
+    Returns (state, items). The first call (prev=None) only establishes the
+    baseline — currently-running sessions are not replayed as transitions.
+    ``status`` mirrors the run vocabulary: "running" on start, "ok"/"error"
+    on finish (from end_reason, like _run_dict).
+    """
+    state: dict = {}
+    for p in profiles:
+        snap = _session_lifecycle_snapshot(p)
+        # Keep the previous view of a profile whose store couldn't be read.
+        state[p] = snap if snap is not None else (prev or {}).get(p, {})
+    if prev is None:
+        return state, []
+    items: list = []
+    now = time.time()
+    for p in profiles:
+        before = prev.get(p, {})
+        after = state.get(p, {})
+        for sid, source in after.items():
+            if sid not in before:
+                items.append({
+                    "profile": p, "session_id": sid, "source": source,
+                    "status": "running", "ts": now,
+                })
+        ended_ids = [sid for sid in before if sid not in after]
+        sources = {sid: before[sid] for sid in ended_ids}
+        rows = {r["id"]: r for r in _session_ended_rows(p, ended_ids)}
+        for sid in ended_ids:
+            row = rows.get(sid)
+            # A vanished row (deleted session) still ends the run for clients.
+            end_reason = str(row["end_reason"] or "") if row else ""
+            items.append({
+                "profile": p, "session_id": sid,
+                "source": (row["source"] if row else None) or sources.get(sid) or "",
+                "status": "error" if "error" in end_reason.lower() else "ok",
+                "ended_at": row["ended_at"] if row else None,
+                "end_reason": end_reason or None,
+                "ts": now,
+            })
+    return state, items
+
+
 def _events_max_id(profile: str) -> int:
     try:
         path = _state_db_path(profile)
@@ -1713,6 +2068,7 @@ async def events_ws(ws: WebSocket):
         # GET /threads, and new messages announce themselves here anyway.
         status: dict = {}
         last_pulse = 0.0
+        lifecycle: Optional[dict] = None  # unfinished-session baseline per profile
         while True:
             busy = await asyncio.to_thread(_typing_set)
             now = {"running": bool(busy), "count": len(busy)}
@@ -1723,6 +2079,12 @@ async def events_ws(ws: WebSocket):
             cursors, items = await asyncio.to_thread(_events_fetch, cursors)
             if items:
                 await ws.send_json({"type": "messages", "cursor": cursors, "items": items})
+            lifecycle, transitions = await asyncio.to_thread(
+                _session_transitions, profiles, lifecycle
+            )
+            if transitions:
+                await ws.send_json({"type": "session", "sessions": transitions,
+                                    "ts": time.time()})
             await asyncio.sleep(_EVENT_POLL_SECONDS)
     except WebSocketDisconnect:
         return
