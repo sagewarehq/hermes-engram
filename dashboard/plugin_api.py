@@ -1622,20 +1622,23 @@ async def events_ws(ws: WebSocket):
         since_raw = ws.query_params.get("since")
         cursors = await asyncio.to_thread(_initial_cursors, profiles, since_raw)
 
-        typing: frozenset = await asyncio.to_thread(_typing_set)
-        await ws.send_json({"type": "hello", "cursor": cursors, "typing": sorted(typing)})
+        busy: frozenset = await asyncio.to_thread(_typing_set)
+        status = {"running": bool(busy), "count": len(busy)}
+        await ws.send_json({"type": "hello", "cursor": cursors, "agent": status})
         while True:
             cursors, items = await asyncio.to_thread(_events_fetch, cursors)
             if items:
                 await ws.send_json({"type": "messages", "cursor": cursors, "items": items})
-            # Typing indicator: diff the gateway's mid-turn session set and
-            # push only on change. "typing" here means the whole turn —
-            # thinking, tool calls, generation — matching the prototype's
-            # per-thread pulsing dots rather than token-level deltas.
-            now_typing = await asyncio.to_thread(_typing_set)
-            if now_typing != typing:
-                typing = now_typing
-                await ws.send_json({"type": "typing", "threads": sorted(typing)})
+            # Global agent activity light — fires only when the busy/idle
+            # state (or concurrent-turn count) changes. Deliberately NOT
+            # per-thread: per-thread state lives on GET /threads (status/
+            # running), and new messages announce themselves on this socket
+            # anyway. One turn = two frames (start, finish).
+            busy = await asyncio.to_thread(_typing_set)
+            now = {"running": bool(busy), "count": len(busy)}
+            if now != status:
+                status = now
+                await ws.send_json({"type": "agent_status", **status})
             await asyncio.sleep(_EVENT_POLL_SECONDS)
     except WebSocketDisconnect:
         return
