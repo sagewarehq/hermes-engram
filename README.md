@@ -15,6 +15,40 @@ message stream over HTTP + WebSocket, mounted by the hermes dashboard at:
   `GET /spec/docs` (Swagger UI, logged-in browser)
 - **Implementation:** [dashboard/plugin_api.py](dashboard/plugin_api.py)
 
+## Install on another instance (from git)
+
+hermes has a built-in git plugin installer; this repo is the package. Push it to a git
+host as `hermes-engram` (the install dir is derived from the repo name and must match the
+plugin name), then on the target instance:
+
+```sh
+hermes plugins install <owner>/hermes-engram --enable   # or a full git/ssh URL
+hermes dashboard   # (re)start — the API mounts at /api/plugins/hermes-engram
+```
+
+Updates later: `hermes plugins update hermes-engram` + dashboard restart.
+Remove: `hermes plugins remove hermes-engram`.
+
+Per-instance setup the installer does NOT cover:
+
+1. **Remote access (the mobile app):** a non-loopback bind requires an auth provider.
+   Configure `dashboard.basic_auth` in that instance's `~/.hermes/config.yaml`:
+
+   ```yaml
+   dashboard:
+     basic_auth:
+       username: <user>
+       password_hash: "<scrypt hash>"   # python -c "from plugins.dashboard_auth.basic import hash_password; print(hash_password('...'))"
+       secret: "<32+ random bytes>"     # stable token signing — sessions survive restarts
+       session_ttl_seconds: 2592000
+   ```
+
+   Then run `hermes dashboard --host <tailscale-ip> --port 9119 --no-open`.
+2. **Routine execution:** the cron scheduler lives in the gateway — `hermes gateway install`
+   (otherwise routines only fire via manual `hermes cron tick`).
+3. The plugin tolerates hermes version skew (signature fallbacks for older installs), but
+   it needs the dashboard plugin system — any reasonably current hermes-agent.
+
 ## Install (symlink, for development)
 
 ```sh
