@@ -401,20 +401,23 @@ loopback token) / `?ticket=`. The cursor is an **opaque JSON object** (`{profile
 Server → client frames:
 
 ```json
-{"type": "hello", "cursor": {"default": 1807, "erudifi": 177},
- "agent": {"running": false, "count": 0}}
+{"type": "hello", "cursor": {"default": 1807, "erudifi": 177}}
+{"type": "pulse", "running": false, "count": 0, "ts": 1783971000.1}
 {"type": "messages", "cursor": {"default": 1809, "erudifi": 177},
  "items": [{"id": 1809, "profile": "default", "session_id": "20260714_…",
              "kind": "agent", "text": "…", "tool_name": null, "ts": 1752448100.0}]}
-{"type": "agent_status", "running": true, "count": 1}
+{"type": "pulse", "running": true, "count": 1, "ts": 1783971004.2}
 ```
 
-**Agent activity light:** an `agent_status` frame fires only when the agent flips between
-busy and idle (or the concurrent-turn `count` changes); the current state arrives in
-`hello`. Drive the prototype's header pulse ("N running") from it. It is deliberately
-global, not per-thread — per-thread state is the `status`/`running` fields on
-`GET /threads`, and new messages announce themselves on this socket anyway. Granularity
-is the poll interval (~1.5s); one turn produces exactly two frames.
+**Pulse — activity light + keepalive in one frame.** Sent immediately after `hello`, on
+every busy/idle flip (and concurrent-turn `count` change), and at least every **25s**
+regardless. Two client behaviors bind to it:
+
+1. Header indicator: `running` drives the prototype's pulse dot, `count` the "N running"
+   label. Global by design — per-thread state is the `status`/`running` fields on
+   `GET /threads`, and new messages announce themselves on this socket anyway.
+2. Staleness watchdog: if no frame of any kind arrives for ~40s (1.5× the pulse
+   interval), consider the connection dead and reconnect with the last `cursor`.
 
 Every persisted message (from any surface: this API, the TUI, the desktop app, cron runs)
 appears here — the feed screen updates no matter where a turn ran. Token-level streaming

@@ -44,6 +44,7 @@ log = logging.getLogger(__name__)
 VERSION = "0.1.0"
 SOURCE_LABEL = "engram"
 _EVENT_POLL_SECONDS = 1.5
+_PULSE_INTERVAL = 25.0  # max seconds between pulse frames (keepalive bound)
 _RPC_TIMEOUT_SECONDS = 60.0
 _MAX_SOUL_BYTES = 256 * 1024
 
@@ -1622,23 +1623,25 @@ async def events_ws(ws: WebSocket):
         since_raw = ws.query_params.get("since")
         cursors = await asyncio.to_thread(_initial_cursors, profiles, since_raw)
 
-        busy: frozenset = await asyncio.to_thread(_typing_set)
-        status = {"running": bool(busy), "count": len(busy)}
-        await ws.send_json({"type": "hello", "cursor": cursors, "agent": status})
+        await ws.send_json({"type": "hello", "cursor": cursors})
+        # Pulse = global agent activity light + keepalive in one frame.
+        # Sent immediately after hello, then on every busy/idle flip, and at
+        # least every _PULSE_INTERVAL seconds regardless — a client watchdog
+        # that hasn't seen ANY frame for ~1.5x the interval should reconnect.
+        # Deliberately global, not per-thread: per-thread state lives on
+        # GET /threads, and new messages announce themselves here anyway.
+        status: dict = {}
+        last_pulse = 0.0
         while True:
+            busy = await asyncio.to_thread(_typing_set)
+            now = {"running": bool(busy), "count": len(busy)}
+            if now != status or time.time() - last_pulse >= _PULSE_INTERVAL:
+                status = now
+                last_pulse = time.time()
+                await ws.send_json({"type": "pulse", **status, "ts": last_pulse})
             cursors, items = await asyncio.to_thread(_events_fetch, cursors)
             if items:
                 await ws.send_json({"type": "messages", "cursor": cursors, "items": items})
-            # Global agent activity light — fires only when the busy/idle
-            # state (or concurrent-turn count) changes. Deliberately NOT
-            # per-thread: per-thread state lives on GET /threads (status/
-            # running), and new messages announce themselves on this socket
-            # anyway. One turn = two frames (start, finish).
-            busy = await asyncio.to_thread(_typing_set)
-            now = {"running": bool(busy), "count": len(busy)}
-            if now != status:
-                status = now
-                await ws.send_json({"type": "agent_status", **status})
             await asyncio.sleep(_EVENT_POLL_SECONDS)
     except WebSocketDisconnect:
         return
